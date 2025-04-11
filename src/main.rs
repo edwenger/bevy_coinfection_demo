@@ -1,7 +1,6 @@
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts, EguiPlugin};
 use bevy::window::PrimaryWindow;
-use bevy::render::camera::ScalingMode;
 use rand::distributions::{Uniform, Distribution};
 
 fn main() {
@@ -81,6 +80,7 @@ impl Default for SimulationSpeed {
 #[derive(Component, Default)]
 struct Host {
     on_prophylaxis: bool,
+    prophylaxis_end_day: Option<u32>, // Tracks when prophylaxis ends
     treat_request_day: Option<u32>, // pending treatment
 }
 
@@ -96,7 +96,6 @@ enum InfectionState {
     E, // Exposed
     A, // Acute
     C, // Chronic
-    S, // Cleared
 }
 
 #[derive(Component)]
@@ -113,7 +112,7 @@ fn setup(
 
     let bottom_y = -window.height() / 4.0 + 40.0; // Adjusted to position hosts comfortably above the bottom edge
 
-    let host_count = 5;
+    let host_count = 10;
     let spacing = window.width() / (host_count as f32 + 1.0) / 2.0; // Dynamically calculate spacing based on window width
 
     for i in 0..host_count {
@@ -181,6 +180,7 @@ fn setup(
 fn update_inoculations(
     mut commands: Commands,
     mut inoc_query: Query<(Entity, &mut Inoculation, &Parent)>,
+    mut host_query: Query<(Entity, &mut Host, Option<&Children>)>, // Allow optional children
     params: Res<Params>,
     sim_time: Res<SimulationTime>,
 ) {
@@ -189,6 +189,15 @@ fn update_inoculations(
 
         match inoc.state {
             InfectionState::E if days_elapsed >= inoc.delay_days => {
+                if let Ok((_, host, _)) = host_query.get(parent.get()) {
+                    // If the host is under prophylaxis, clear the inoculation
+                    if host.on_prophylaxis {
+                        commands.entity(parent.get()).remove_children(&[entity]);
+                        commands.entity(entity).despawn();
+                        continue;
+                    }
+                }
+
                 let mut rng = rand::thread_rng();
                 let goes_acute = rand::random::<f32>() < params.prob_acute;
 
@@ -204,6 +213,16 @@ fn update_inoculations(
                 } else {
                     params.duration_chronic.sample(&mut rng)
                 };
+
+                // Trigger possible treatment
+                if goes_acute && rand::random::<f32>() < params.prob_treatment {
+                    if let Ok((_, mut host, _)) = host_query.get_mut(parent.get()) {
+                        let new_treat_request_day = sim_time.day + params.treatment_delay.sample(&mut rng) as u32;
+                        if host.treat_request_day.is_none() || new_treat_request_day < host.treat_request_day.unwrap() {
+                            host.treat_request_day = Some(new_treat_request_day);
+                        }
+                    }
+                }
             }
 
             InfectionState::A if days_elapsed >= inoc.delay_days => {
@@ -226,6 +245,38 @@ fn update_inoculations(
             _ => {}
         }
     }
+
+    // Process treatment requests and prophylaxis duration
+    for (host_entity, mut host, children) in host_query.iter_mut() {
+        if let Some(treat_request_day) = host.treat_request_day {
+            if sim_time.day >= treat_request_day {
+                // Clear all inoculations for this host if there are children
+                if let Some(children) = children {
+                    for &child in children.iter() {
+                        commands.entity(host_entity).remove_children(&[child]);
+                        commands.entity(child).despawn();
+                    }
+                }
+
+                // Set prophylaxis state
+                host.on_prophylaxis = true;
+                host.prophylaxis_end_day = Some(sim_time.day + params.duration_prophylaxis as u32);
+                host.treat_request_day = None;
+
+                // println!("Host {:?} started prophylaxis on day {} until day {:?}.", host_entity, sim_time.day, host.prophylaxis_end_day.unwrap());
+            }
+        }
+
+        // End prophylaxis if the duration has passed
+        if let Some(prophylaxis_end_day) = host.prophylaxis_end_day {
+            if sim_time.day >= prophylaxis_end_day {
+                host.on_prophylaxis = false;
+                host.prophylaxis_end_day = None;
+
+                // println!("Host {:?} ended prophylaxis on day {}.", host_entity, sim_time.day);
+            }
+        }
+    }
 }
 
 fn update_inoculation_visuals(mut inoc_query: Query<(&Inoculation, &mut Sprite)>) {
@@ -234,7 +285,6 @@ fn update_inoculation_visuals(mut inoc_query: Query<(&Inoculation, &mut Sprite)>
             InfectionState::E => Color::BLUE,
             InfectionState::A => Color::RED,
             InfectionState::C => Color::ORANGE,
-            InfectionState::S => Color::GREEN,
         };
     }
 }
@@ -276,22 +326,39 @@ fn simulation_controls_ui(mut contexts: EguiContexts, mut params: ResMut<Params>
             if response.changed() {
                 params.incidence_rate = param_value;
             }
+
+            ui.label("Prophylaxis Duration");
+
+            let mut param_value = params.duration_prophylaxis;
+            let response = ui.add(egui::Slider::new(&mut param_value, 1.0..=30.0).text("Prophylaxis Duration"));
+
+            if response.changed() {
+                params.duration_prophylaxis = param_value;
+            }
+
+            ui.label("Treatment Probability");
+
+            let mut param_value = params.prob_treatment;
+            let response = ui.add(egui::Slider::new(&mut param_value, 0.0..=1.0).text("Treatment Probability"));
+
+            if response.changed() {
+                params.prob_treatment = param_value;
+            }
         });
 }
 
 fn spawn_infections(
     mut commands: Commands,
-    mut host_query: Query<(Entity, &Children)>,
+    mut host_query: Query<(Entity, Option<&Children>), With<Host>>, // Wrap Children in Option<>
     params: Res<Params>,
     sim_time: Res<SimulationTime>,
     time: Res<Time>,
     speed: Res<SimulationSpeed>,
 ) {
-
     for (host_entity, children) in host_query.iter_mut() {
         if rand::random::<f32>() < params.incidence_rate * time.delta_seconds() * speed.multiplier {
             // Calculate position for the new inoculation
-            let y_offset = children.len() as f32 * 40.0; // Stack inoculations vertically
+            let y_offset = children.map_or(0.0, |c| c.len() as f32 * 40.0); // Handle optional children
 
             // Spawn a new Inoculation as a child of the Host
             commands.entity(host_entity).with_children(|parent| {
