@@ -19,6 +19,7 @@ fn main() {
         .add_systems(Update, simulation_controls_ui)
         .add_systems(Update, spawn_infections)
         .add_systems(Update, update_inoculation_positions)
+        .add_systems(Update, update_host_sprites)
         .run();
 }
 
@@ -84,6 +85,42 @@ struct Host {
     treat_request_day: Option<u32>, // pending treatment
 }
 
+impl Host {
+    pub fn state(&self, inoculations: Option<&Children>, inoc_query: &Query<&Inoculation>) -> &str {
+        if self.on_prophylaxis {
+            return "P";
+        }
+
+        if let Some(children) = inoculations {
+            let mut has_acute = false;
+            let mut has_chronic = false;
+            let mut has_exposed = false;
+
+            for &child in children.iter() {
+                if let Ok(inoc) = inoc_query.get(child) {
+                    match inoc.state {
+                        InfectionState::A => has_acute = true,
+                        InfectionState::C => has_chronic = true,
+                        InfectionState::E => has_exposed = true,
+                    }
+                }
+            }
+
+            if has_acute {
+                return "A";
+            }
+            if has_chronic {
+                return "C";
+            }
+            if has_exposed {
+                return "E";
+            }
+        }
+
+        "S"
+    }
+}
+
 #[derive(Component)]
 struct Inoculation {
     state: InfectionState,
@@ -101,6 +138,7 @@ enum InfectionState {
 #[derive(Component)]
 struct TimeText;
 
+
 fn setup(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
@@ -110,13 +148,13 @@ fn setup(
 ) {
     let window = query.single(); // Get the primary window
 
-    let bottom_y = -window.height() / 4.0 + 40.0; // Adjusted to position hosts comfortably above the bottom edge
+    let bottom_y = -window.height() / 2.0 + 40.0; // Adjusted to position hosts comfortably above the bottom edge
 
     let host_count = 10;
-    let spacing = window.width() / (host_count as f32 + 1.0) / 2.0; // Dynamically calculate spacing based on window width
+    let spacing = window.width() / (host_count as f32 + 1.0) / 1.0; // Dynamically calculate spacing based on window width
 
     for i in 0..host_count {
-        let x = (i as f32 + 1.0) * spacing - window.width() / 4.0; // Distribute hosts evenly across the screen
+        let x = (i as f32 + 1.0) * spacing - window.width() / 2.0; // Distribute hosts evenly across the screen
 
         // Spawn Host with Inoculation
         commands
@@ -124,7 +162,12 @@ fn setup(
                 Host {
                     ..default()
                 },
-                SpatialBundle {
+                SpriteBundle {
+                    sprite: Sprite {
+                        color: Color::GRAY, // Default to susceptible
+                        custom_size: Some(Vec2::new(50.0, 5.0)),
+                        ..default()
+                    },
                     transform: Transform::from_xyz(x, bottom_y, 0.0),
                     ..default()
                 },
@@ -289,6 +332,23 @@ fn update_inoculation_visuals(mut inoc_query: Query<(&Inoculation, &mut Sprite)>
     }
 }
 
+fn update_host_sprites(
+    mut host_query: Query<(&Host, Option<&Children>, &mut Sprite)>, // Made host_query mutable
+    inoc_query: Query<&Inoculation>,
+) {
+    for (host, children, mut sprite) in host_query.iter_mut() {
+        let state = host.state(children, &inoc_query);
+        sprite.color = match state {
+            "P" => Color::GREEN, // Prophylaxis
+            "A" => Color::RED,   // Acute
+            "C" => Color::ORANGE, // Chronic
+            "E" => Color::BLUE,  // Exposed
+            "S" => Color::GRAY,  // Susceptible
+            _ => Color::WHITE,    // Default fallback
+        };
+    }
+}
+
 fn update_simulation_time(
     time: Res<Time>,
     speed: Res<SimulationSpeed>,
@@ -387,10 +447,10 @@ fn update_inoculation_positions(
     host_query: Query<(&Children, &Transform), With<Host>>,
     mut inoc_query: Query<&mut Transform, (With<Inoculation>, Without<Host>)>,
 ) {
-    for (children, host_transform) in host_query.iter() {
+    for (children, _) in host_query.iter() {
         for (index, &child) in children.iter().enumerate() {
             if let Ok(mut inoc_transform) = inoc_query.get_mut(child) {
-                inoc_transform.translation = host_transform.translation + Vec3::new(0.0, index as f32 * 40.0, 0.1);
+                inoc_transform.translation = Vec3::new(0.0, (0.5 + index as f32) * 40.0, 0.1);
             }
         }
     }
